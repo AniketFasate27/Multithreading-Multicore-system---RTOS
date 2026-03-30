@@ -1,0 +1,296 @@
+/*
+ * ============================================================
+ *  ESP32 FreeRTOS — Motor Control + Monitoring System
+ *  Platform : ESP32 (Arduino Framework)
+ *  Author   : Based on "Real-Time Magic" by Aniket Fasate
+ * ============================================================
+ *  Hardware (L298N Motor Driver):
+ *    ENA  → GPIO 25  (PWM speed control)
+ *    IN1  → GPIO 26  (direction pin A)
+ *    IN2  → GPIO 27  (direction pin B)
+ *    TACH → GPIO 34  (encoder/tachometer input, INPUT only pin)
+ *
+ *  FreeRTOS Features Demonstrated:
+ *    ✅ xTaskCreatePinnedToCore  (Core 0 = motor, Core 1 = monitor)
+ *    ✅ vTaskSuspend / vTaskResume
+ *    ✅ vTaskDelete
+ *    ✅ vTaskDelay  (non-blocking RTOS delay)
+ *    ✅ Mutex       (shared motor state between tasks)
+ * ============================================================
+ */
+
+#include <Arduino.h>
+
+// ─── Pin Definitions ────────────────────────────────────────
+#define ENA_PIN   25   // PWM → motor speed
+#define IN1_PIN   26   // Direction control A
+#define IN2_PIN   27   // Direction control B
+#define TACH_PIN  34   // Tachometer / encoder feedback (read-only)
+
+// ─── PWM Configuration ──────────────────────────────────────
+#define PWM_CHANNEL    0
+#define PWM_FREQ       5000    // 5 kHz
+#define PWM_RESOLUTION 8       // 8-bit → 0–255
+#define MOTOR_MAX_DUTY 200     // Cap duty cycle for safety
+
+// ─── Shared Motor State (protected by mutex) ────────────────
+typedef enum {
+  MOTOR_STOPPED  = 0,
+  MOTOR_FORWARD  = 1,
+  MOTOR_REVERSE  = 2,
+  MOTOR_BRAKING  = 3
+} MotorDirection_t;
+
+typedef struct {
+  uint8_t           dutyCycle;    // 0–200
+  MotorDirection_t  direction;
+  uint32_t          rpm;          // Simulated/measured RPM
+  bool              faultDetected;
+} MotorState_t;
+
+volatile MotorState_t g_motorState = {0, MOTOR_STOPPED, 0, false};
+
+// ─── RTOS Handles ───────────────────────────────────────────
+TaskHandle_t motorTaskHandle    = NULL;
+TaskHandle_t monitorTaskHandle  = NULL;
+TaskHandle_t supervisorTaskHandle = NULL;
+
+SemaphoreHandle_t motorMutex = NULL;   // Guards g_motorState
+
+// ─── Tachometer (ISR-based RPM counting) ────────────────────
+volatile uint32_t g_pulseCount = 0;
+
+void IRAM_ATTR tachISR() {
+  g_pulseCount++;  // Increment on each encoder pulse
+}
+
+// ─── Helper: Apply motor state to hardware ──────────────────
+void applyMotorState(const MotorState_t& state) {
+  switch (state.direction) {
+    case MOTOR_FORWARD:
+      digitalWrite(IN1_PIN, HIGH);
+      digitalWrite(IN2_PIN, LOW);
+      ledcWrite(PWM_CHANNEL, state.dutyCycle);
+      break;
+    case MOTOR_REVERSE:
+      digitalWrite(IN1_PIN, LOW);
+      digitalWrite(IN2_PIN, HIGH);
+      ledcWrite(PWM_CHANNEL, state.dutyCycle);
+      break;
+    case MOTOR_BRAKING:
+      digitalWrite(IN1_PIN, HIGH);
+      digitalWrite(IN2_PIN, HIGH);
+      ledcWrite(PWM_CHANNEL, 0);
+      break;
+    case MOTOR_STOPPED:
+    default:
+      digitalWrite(IN1_PIN, LOW);
+      digitalWrite(IN2_PIN, LOW);
+      ledcWrite(PWM_CHANNEL, 0);
+      break;
+  }
+}
+
+// ============================================================
+//  TASK 1 — motorControlTask  (Pinned to CORE 0)
+//  Runs a simple speed profile: ramp up → hold → ramp down → reverse
+// ============================================================
+void motorControlTask(void* param) {
+  Serial.println("[MotorTask] Started on Core " + String(xPortGetCoreID()));
+
+  const TickType_t stepDelay = pdMS_TO_TICKS(100);  // 100 ms per step
+
+  while (true) {
+
+    // --- Phase 1: Ramp UP (Forward) ---
+    Serial.println("[MotorTask] Phase: Ramp UP Forward");
+    for (uint8_t duty = 0; duty <= MOTOR_MAX_DUTY; duty += 10) {
+      if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_motorState.dutyCycle = duty;
+        g_motorState.direction = MOTOR_FORWARD;
+        applyMotorState(g_motorState);
+        xSemaphoreGive(motorMutex);
+      }
+      vTaskDelay(stepDelay);
+    }
+
+    // --- Phase 2: Hold at max speed for 3 seconds ---
+    Serial.println("[MotorTask] Phase: Hold MAX Speed");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // --- Phase 3: Ramp DOWN (Forward) ---
+    Serial.println("[MotorTask] Phase: Ramp DOWN");
+    for (int duty = MOTOR_MAX_DUTY; duty >= 0; duty -= 10) {
+      if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_motorState.dutyCycle = (uint8_t)duty;
+        applyMotorState(g_motorState);
+        xSemaphoreGive(motorMutex);
+      }
+      vTaskDelay(stepDelay);
+    }
+
+    // --- Phase 4: Brake ---
+    Serial.println("[MotorTask] Phase: Braking");
+    if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      g_motorState.direction = MOTOR_BRAKING;
+      applyMotorState(g_motorState);
+      xSemaphoreGive(motorMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // --- Phase 5: Reverse at half speed ---
+    Serial.println("[MotorTask] Phase: REVERSE");
+    if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      g_motorState.dutyCycle = MOTOR_MAX_DUTY / 2;
+      g_motorState.direction = MOTOR_REVERSE;
+      applyMotorState(g_motorState);
+      xSemaphoreGive(motorMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // --- Phase 6: Stop ---
+    Serial.println("[MotorTask] Phase: STOP");
+    if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      g_motorState.dutyCycle = 0;
+      g_motorState.direction = MOTOR_STOPPED;
+      applyMotorState(g_motorState);
+      xSemaphoreGive(motorMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));  // Pause before next cycle
+  }
+}
+
+// ============================================================
+//  TASK 2 — monitorTask  (Pinned to CORE 1)
+//  Reads RPM from tachometer and logs motor state every 500 ms.
+//  Detects a simulated overcurrent fault.
+// ============================================================
+void monitorTask(void* param) {
+  Serial.println("[MonitorTask] Started on Core " + String(xPortGetCoreID()));
+
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(500);
+
+  // Simulated fault trigger counter
+  uint8_t cycleCount = 0;
+
+  while (true) {
+    vTaskDelayUntil(&lastWakeTime, period);  // Precise 500 ms period
+
+    // --- Calculate RPM from pulse count (reset every 500 ms) ---
+    uint32_t pulses = g_pulseCount;
+    g_pulseCount = 0;
+    // Assuming 20 pulses per revolution → RPM = (pulses / 20) * 120
+    uint32_t rpm = (pulses * 120) / 20;
+
+    // --- Read & update shared state ---
+    if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      g_motorState.rpm = rpm;
+
+      // Simulate fault: if duty > 150 and RPM suspiciously low → overcurrent
+      if (g_motorState.dutyCycle > 150 && rpm < 50 && g_motorState.direction != MOTOR_STOPPED) {
+        g_motorState.faultDetected = true;
+      }
+
+      // Log snapshot
+      const char* dirStr[] = {"STOPPED", "FORWARD", "REVERSE", "BRAKING"};
+      Serial.printf("[Monitor] Duty: %3d | Dir: %-8s | RPM: %4lu | Fault: %s\n",
+        g_motorState.dutyCycle,
+        dirStr[g_motorState.direction],
+        g_motorState.rpm,
+        g_motorState.faultDetected ? "YES ⚠️" : "NO"
+      );
+
+      bool fault = g_motorState.faultDetected;
+      xSemaphoreGive(motorMutex);
+
+      // If fault → suspend motor task, resume supervisor to handle it
+      if (fault) {
+        Serial.println("[Monitor] ⚠️  Fault detected! Suspending motor task...");
+        vTaskSuspend(motorTaskHandle);  // Suspend motor immediately
+        vTaskResume(supervisorTaskHandle);
+      }
+    }
+
+    cycleCount++;
+  }
+}
+
+// ============================================================
+//  TASK 3 — supervisorTask  (Pinned to CORE 1, low priority)
+//  Starts suspended. Woken by monitorTask on fault.
+//  Handles fault recovery, then deletes itself.
+// ============================================================
+void supervisorTask(void* param) {
+  Serial.println("[Supervisor] Started on Core " + String(xPortGetCoreID()));
+
+  // Immediately suspend self — waits to be resumed by monitorTask
+  vTaskSuspend(NULL);
+
+  // ── Execution resumes here after vTaskResume() is called ──
+  Serial.println("[Supervisor] Woke up! Handling FAULT recovery...");
+
+  // Step 1: Emergency stop
+  if (xSemaphoreTake(motorMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    g_motorState.dutyCycle  = 0;
+    g_motorState.direction  = MOTOR_STOPPED;
+    g_motorState.faultDetected = false;
+    applyMotorState(g_motorState);
+    xSemaphoreGive(motorMutex);
+  }
+  Serial.println("[Supervisor] Emergency stop applied.");
+
+  // Step 2: Cooldown period
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  Serial.println("[Supervisor] Cooldown complete. Resuming motor task.");
+
+  // Step 3: Resume motor task
+  vTaskResume(motorTaskHandle);
+
+  // Step 4: Supervisor's job is done — delete itself
+  Serial.println("[Supervisor] Task complete. Deleting self.");
+  vTaskDelete(NULL);  // ← Self-delete; motorTaskHandle & monitorTask continue
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== ESP32 FreeRTOS Motor Control System ===");
+
+  // --- GPIO Init ---
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+  pinMode(TACH_PIN, INPUT_PULLUP);
+
+  // --- PWM Init ---
+  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(ENA_PIN, PWM_CHANNEL);
+
+  // --- Tachometer ISR ---
+  attachInterrupt(digitalPinToInterrupt(TACH_PIN), tachISR, RISING);
+
+  // --- Mutex ---
+  motorMutex = xSemaphoreCreateMutex();
+  if (motorMutex == NULL) {
+    Serial.println("ERROR: Failed to create mutex!");
+    while (true);
+  }
+
+  // ─── Create Tasks ───────────────────────────────────────
+  //                     Function         Name           Stack   Param  Prio  Handle        Core
+  xTaskCreatePinnedToCore(motorControlTask, "MotorCtrl",  4096,  NULL,  2,    &motorTaskHandle,      0);
+  xTaskCreatePinnedToCore(monitorTask,      "Monitor",    4096,  NULL,  2,    &monitorTaskHandle,    1);
+  xTaskCreatePinnedToCore(supervisorTask,   "Supervisor", 4096,  NULL,  1,    &supervisorTaskHandle, 1);
+
+  Serial.println("[Setup] All tasks created. Scheduler running.");
+}
+
+// ============================================================
+//  LOOP — Intentionally idle (FreeRTOS scheduler takes over)
+// ============================================================
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));  // Yield CPU — don't use delay()
+}
